@@ -1,12 +1,7 @@
 streamlit
 xarray
-matplotlib
-scipy
 numpy
-netcdf4
-dask
-bottleneck
-tensorflow-cpu
-imageio
+matplotlib
+tensorflow
 h5netcdf
-
+netCDF4
