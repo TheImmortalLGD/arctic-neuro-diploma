@@ -1,0 +1,8 @@
+streamlit
+xarray
+matplotlib
+scipy
+numpy
+netcdf4
+dask
+bottleneck
