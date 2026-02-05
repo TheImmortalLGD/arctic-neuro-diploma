@@ -8,3 +8,5 @@ dask
 bottleneck
 tensorflow-cpu
 imageio
+h5netcdf
+
