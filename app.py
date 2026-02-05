@@ -97,70 +97,83 @@ with st.sidebar:
 # --- ЛОГИКА ---
 if 'btn' in locals() and btn:
     try:
-        status = st.status("Расчет прогноза...", expanded=True)
+        status = st.status("Диагностика и чтение данных...", expanded=True)
         
-        # === ФУНКЦИЯ БЕЗОПАСНОГО ЧТЕНИЯ ===
-        def safe_read(file_obj, temp_name):
+        # === ФУНКЦИЯ ЧТЕНИЯ С ВЫВОДОМ ОШИБОК ===
+        def safe_read_debug(file_obj, temp_name):
+            # 1. Запись
             file_obj.seek(0)
             with open(temp_name, "wb") as f:
                 f.write(file_obj.read())
             
-            engines = ['netcdf4', 'h5netcdf', 'scipy', None]
+            # 2. Проверка размера (Сразу скажет, если это LFS ссылка)
+            size = os.path.getsize(temp_name)
+            if size < 3000:
+                st.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Файл '{file_obj.name}' весит всего {size} байт!")
+                st.warning("Это не спутниковый снимок, а текстовая ссылка GitHub LFS. Загрузите ОРИГИНАЛЬНЫЙ файл с вашего компьютера.")
+                st.stop()
+
+            # 3. Попытка открыть разными методами
+            engines = ['netcdf4', 'h5netcdf', 'scipy']
+            errors_log = []
+            
             for eng in engines:
                 try:
-                    return xr.open_dataset(temp_name, engine=eng)
-                except:
-                    continue
-            raise ValueError("Ошибка чтения файла")
+                    ds = xr.open_dataset(temp_name, engine=eng)
+                    # Если открылось - ура, возвращаем
+                    return ds
+                except Exception as e:
+                    errors_log.append(f"Движок '{eng}': {str(e)}")
+            
+            # Если дошли сюда - значит ни один не открыл
+            st.error(f"❌ Не удалось открыть файл '{file_obj.name}'. Отчет об ошибках:")
+            for err in errors_log:
+                st.code(err, language='text')
+            
+            st.info("💡 ПОДСКАЗКА: Если ошибка 'HDF error' - файл битый. Если 'libnetcdf not found' - нет packages.txt.")
+            st.stop()
 
         # 1. ЧТЕНИЕ СТАРТА
-        ds = safe_read(file_db[start_date], "temp_start.nc")
+        ds = safe_read_debug(file_db[start_date], "temp_start.nc")
         var_name = [v for v in ds.data_vars if 'ice' in v or 'conc' in v][0]
         data_raw = ds[var_name].isel(time=0).squeeze().values
         
-        # Маска суши (запоминаем один раз)
+        # Маска
         land_mask = np.isnan(data_raw) | (data_raw > 100)
         orig_shape = data_raw.shape
         
         # Первичная очистка
         current_img = clean_data_initial(data_raw)
         
-        # Подготовка тензора
+        # Тензор
         input_tensor = tf.image.resize(current_img[..., np.newaxis], [256, 256])
         input_batch = np.expand_dims(input_tensor, axis=0)
         
-        # 2. ЦИКЛ ПРОГНОЗА (ИСПРАВЛЕННЫЙ)
+        # 2. ЦИКЛ ПРОГНОЗА
         prog_bar = status.progress(0)
         alpha = 0.75 
         
         for day in range(1, horizon + 1):
-            # Прогноз
             pred_ai = model.predict(input_batch, verbose=0)
-            
-            # Стабилизация
             pred_stab = (input_batch * alpha) + (pred_ai * (1 - alpha))
             pred_clean = tf.where(pred_stab > 0.1, pred_stab, 0.0)
-            
-            # ВАЖНО: Мы просто передаем выход на вход следующего шага
-            # Без повторной нормализации!
             input_batch = pred_clean
             
-            status.write(f"✅ День {day}: Готово")
+            status.write(f"✅ День {day}: Расчет завершен")
             prog_bar.progress(day / horizon)
         
-        # Восстановление размера
+        # Результат
         final_full = tf.image.resize(input_batch[0], [orig_shape[0], orig_shape[1]]).numpy().squeeze()
         final_viz = copy.deepcopy(final_full)
         final_viz[land_mask] = np.nan
         
-        status.update(label="Успешно", state="complete", expanded=False)
+        status.update(label="Готово", state="complete", expanded=False)
 
         # 3. ФАКТ
-        ds_t = safe_read(file_db[target_date], "temp_target.nc")
+        ds_t = safe_read_debug(file_db[target_date], "temp_target.nc")
         target_raw = ds_t[var_name].isel(time=0).squeeze().values
-        
-        # Факт нужно очистить той же функцией, что и старт
         target_clean = clean_data_initial(target_raw)
+        
         target_viz = copy.deepcopy(target_clean)
         target_viz[land_mask] = np.nan
         
@@ -206,7 +219,7 @@ if 'btn' in locals() and btn:
         m3.metric("Статус", "✅ НОРМА" if accuracy > 80 else "⚠️")
 
     except Exception as e:
-        st.error(f"Ошибка: {e}")
+        st.error(f"Системная ошибка: {e}")
 
 elif not uploaded_files:
     st.info("👈 Загрузите файлы.")
