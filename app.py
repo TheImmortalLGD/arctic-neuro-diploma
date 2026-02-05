@@ -10,7 +10,7 @@ import time
 import re
 from datetime import datetime, timedelta
 
-# --- НАСТРОЙКИ ИНТЕРФЕЙСА ---
+# --- НАСТРОЙКИ ---
 st.set_page_config(page_title="Ice Forecast NSR", layout="wide", page_icon="🚢")
 st.markdown("""
     <style>
@@ -23,22 +23,20 @@ st.title("🚢 Модель прогнозирования ледовой обс
 st.markdown("**Система поддержки принятия решений (СППР)**")
 st.markdown("---")
 
-# --- ЗАГРУЗКА МОДЕЛИ ---
+# --- МОДЕЛЬ ---
 @st.cache_resource
 def load_ai_model():
-    # Проверяем наличие файла модели
     if not os.path.exists('ice_model_month_v2.h5'): return None
     return load_model('ice_model_month_v2.h5')
 
 try:
     model = load_ai_model()
 except Exception as e:
-    st.error(f"Ошибка загрузки модели: {e}")
+    st.error(f"Ошибка модели: {e}")
     model = None
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- УТИЛИТЫ ---
 def extract_date(filename):
-    """Извлекает дату из имени файла (например, ...20200401.nc -> 01.04.2020)"""
     match = re.search(r'(\d{8})', filename)
     if match:
         try:
@@ -47,26 +45,25 @@ def extract_date(filename):
             return None
     return None
 
-def clean_data(d):
-    """Очистка данных: убирает NaN, маскирует сушу, нормализует"""
+def clean_data_initial(d):
+    """Очистка ТОЛЬКО для первого сырого кадра"""
     d = np.nan_to_num(d, nan=0.0)
     d = np.where(d > 100, 0, d)
-    if np.max(d) > 1.05: d = d / 100.0
+    if np.max(d) > 1.05: d = d / 100.0 # Нормализация 0..1
     return d
 
 # --- БОКОВАЯ ПАНЕЛЬ ---
 with st.sidebar:
-    st.header("🗂️ Данные для анализа")
+    st.header("🗂️ Данные")
     
     if model is None:
-        st.error("❌ Файл модели (ice_model_month_v2.h5) не найден.")
+        st.error("❌ Файл модели не найден")
         st.stop()
     else:
-        st.success("✅ Нейросеть активна")
+        st.success("✅ Система готова")
 
-    # ЗАГРУЗКА ФАЙЛОВ ВРУЧНУЮ (Самый надежный способ)
     uploaded_files = st.file_uploader(
-        "Загрузите файлы .nc (Апрель)", 
+        "Загрузите файлы (Апрель)", 
         type=['nc'], 
         accept_multiple_files=True
     )
@@ -79,89 +76,76 @@ with st.sidebar:
                 file_db[dt] = f
         
         sorted_dates = sorted(file_db.keys())
-        st.info(f"В систему загружено: {len(file_db)} снимков")
+        st.info(f"Снимков: {len(file_db)}")
         
         if len(file_db) > 0:
             st.markdown("---")
             start_date = st.selectbox("Дата старта", options=sorted_dates, format_func=lambda x: x.strftime("%d.%m.%Y"))
-            horizon = st.slider("Горизонт прогноза (сут.)", 1, 7, 3)
+            horizon = st.slider("Горизонт (сут.)", 1, 7, 3)
             
             target_date = start_date + timedelta(days=horizon)
             has_truth = target_date in file_db
             
-            st.write(f"Целевая дата: **{target_date.strftime('%d.%m.%Y')}**")
+            st.write(f"Цель: **{target_date.strftime('%d.%m.%Y')}**")
             
             if not has_truth:
-                st.warning("⚠️ Нет файла для проверки прогноза")
+                st.warning("Нет файла для проверки")
                 btn = False
             else:
                 btn = st.button("🚀 ВЫПОЛНИТЬ РАСЧЕТ", type="primary")
 
-# --- ОСНОВНАЯ ЛОГИКА ---
+# --- ЛОГИКА ---
 if 'btn' in locals() and btn:
     try:
-        status = st.status("Инициализация вычислительного ядра...", expanded=True)
+        status = st.status("Расчет прогноза...", expanded=True)
         
-        # === ФУНКЦИЯ БЕЗОПАСНОГО ЧТЕНИЯ (С ЗАЩИТОЙ ОТ ОШИБОК) ===
-        def safe_open_nc(file_obj, temp_name):
-            # 1. Сохраняем во временный файл
+        # === ФУНКЦИЯ БЕЗОПАСНОГО ЧТЕНИЯ ===
+        def safe_read(file_obj, temp_name):
             file_obj.seek(0)
             with open(temp_name, "wb") as f:
                 f.write(file_obj.read())
             
-            # 2. ПРОВЕРКА РАЗМЕРА (Защита от GitHub LFS ссылок)
-            size = os.path.getsize(temp_name)
-            if size < 2000: # Если меньше 2 Кбайт
-                st.error(f"❌ Критическая ошибка: Файл {file_obj.name} поврежден или является ссылкой.")
-                st.warning("Размер файла слишком мал (< 2 Кб). Пожалуйста, загрузите ОРИГИНАЛЬНЫЙ файл с вашего компьютера (размером > 5 Мб).")
-                st.stop()
-            
-            # 3. ПОПЫТКА ОТКРЫТИЯ (Перебор движков)
             engines = ['netcdf4', 'h5netcdf', 'scipy', None]
-            
-            for engine in engines:
+            for eng in engines:
                 try:
-                    ds = xr.open_dataset(temp_name, engine=engine)
-                    return ds
+                    return xr.open_dataset(temp_name, engine=eng)
                 except:
                     continue
-            
-            raise ValueError("Не удалось открыть файл. Проверьте формат NetCDF.")
+            raise ValueError("Ошибка чтения файла")
 
-        # 1. ЧТЕНИЕ СТАРТОВОГО СНИМКА
-        ds = safe_open_nc(file_db[start_date], "temp_start.nc")
-        
-        # Авто-поиск переменной льда
+        # 1. ЧТЕНИЕ СТАРТА
+        ds = safe_read(file_db[start_date], "temp_start.nc")
         var_name = [v for v in ds.data_vars if 'ice' in v or 'conc' in v][0]
         data_raw = ds[var_name].isel(time=0).squeeze().values
         
-        # Подготовка масок
+        # Маска суши (запоминаем один раз)
         land_mask = np.isnan(data_raw) | (data_raw > 100)
         orig_shape = data_raw.shape
-        current_img = clean_data(data_raw)
         
-        # Тензор для нейросети
+        # Первичная очистка
+        current_img = clean_data_initial(data_raw)
+        
+        # Подготовка тензора
         input_tensor = tf.image.resize(current_img[..., np.newaxis], [256, 256])
         input_batch = np.expand_dims(input_tensor, axis=0)
         
-        # 2. ЦИКЛ ПРОГНОЗИРОВАНИЯ
+        # 2. ЦИКЛ ПРОГНОЗА (ИСПРАВЛЕННЫЙ)
         prog_bar = status.progress(0)
-        alpha = 0.75 # Коэффициент инерции (Стабилизатор)
+        alpha = 0.75 
         
         for day in range(1, horizon + 1):
-            # Прогноз ИИ
+            # Прогноз
             pred_ai = model.predict(input_batch, verbose=0)
             
-            # Стабилизация (смешивание с предыдущим шагом)
+            # Стабилизация
             pred_stab = (input_batch * alpha) + (pred_ai * (1 - alpha))
-            
-            # Фильтрация шума
             pred_clean = tf.where(pred_stab > 0.1, pred_stab, 0.0)
             
-            # Обновление входа
+            # ВАЖНО: Мы просто передаем выход на вход следующего шага
+            # Без повторной нормализации!
             input_batch = pred_clean
             
-            status.write(f"✅ День {day}: Моделирование дрейфа завершено")
+            status.write(f"✅ День {day}: Готово")
             prog_bar.progress(day / horizon)
         
         # Восстановление размера
@@ -169,25 +153,26 @@ if 'btn' in locals() and btn:
         final_viz = copy.deepcopy(final_full)
         final_viz[land_mask] = np.nan
         
-        status.update(label="Расчет успешно завершен", state="complete", expanded=False)
+        status.update(label="Успешно", state="complete", expanded=False)
 
-        # 3. ЧТЕНИЕ ФАКТА (TARGET)
-        ds_t = safe_open_nc(file_db[target_date], "temp_target.nc")
+        # 3. ФАКТ
+        ds_t = safe_read(file_db[target_date], "temp_target.nc")
         target_raw = ds_t[var_name].isel(time=0).squeeze().values
-        target_clean = clean_data(target_raw)
         
+        # Факт нужно очистить той же функцией, что и старт
+        target_clean = clean_data_initial(target_raw)
         target_viz = copy.deepcopy(target_clean)
         target_viz[land_mask] = np.nan
         
-        # 4. РАСЧЕТ МЕТРИК И ОШИБОК
+        # 4. МЕТРИКИ
         diff_map = np.abs(final_full - target_clean)
-        diff_map[land_mask] = np.nan # Игнорируем сушу
+        diff_map[land_mask] = np.nan
         
         mae = np.nanmean(diff_map) * 100
         accuracy = 100 - mae
 
-        # 5. ВИЗУАЛИЗАЦИЯ (3 КОЛОНКИ)
-        st.subheader(f"📊 Результаты валидации (Горизонт: {horizon} сут.)")
+        # 5. ВИЗУАЛИЗАЦИЯ
+        st.subheader(f"📊 Результат (Горизонт: {horizon} сут.)")
         
         c1, c2, c3 = st.columns(3)
         cmap = plt.cm.Blues_r.copy()
@@ -208,22 +193,20 @@ if 'btn' in locals() and btn:
             st.pyplot(fig2)
             
         with c3:
-            st.markdown("### 🔥 Карта ошибок")
+            st.markdown("### 🔥 Ошибки")
             fig3, ax3 = plt.subplots(figsize=(6,6), facecolor='#0e1117')
-            # Тепловая карта ошибок (от 0 до 50%)
             im = ax3.imshow(diff_map, cmap='hot', vmin=0, vmax=0.5)
-            plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
             ax3.axis('off')
             st.pyplot(fig3)
             
         st.markdown("---")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Точность прогноза", f"{accuracy:.2f}%")
-        m2.metric("Средняя ошибка (MAE)", f"{mae:.2f}%")
-        m3.metric("Статус теста", "УСПЕХ" if accuracy > 80 else "ТРЕБУЕТ КАЛИБРОВКИ")
+        m1.metric("Точность", f"{accuracy:.2f}%")
+        m2.metric("MAE", f"{mae:.2f}%")
+        m3.metric("Статус", "✅ НОРМА" if accuracy > 80 else "⚠️")
 
     except Exception as e:
-        st.error(f"Системная ошибка: {e}")
+        st.error(f"Ошибка: {e}")
 
 elif not uploaded_files:
-    st.info("👈 Пожалуйста, загрузите .nc файлы (апрель) в меню слева.")
+    st.info("👈 Загрузите файлы.")
