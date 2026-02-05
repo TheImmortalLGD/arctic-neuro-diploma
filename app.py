@@ -10,7 +10,7 @@ import time
 import re
 from datetime import datetime, timedelta
 
-# --- НАСТРОЙКИ ---
+# --- НАСТРОЙКИ СТРАНИЦЫ ---
 st.set_page_config(page_title="Ice Forecast NSR", layout="wide", page_icon="🚢")
 st.markdown("""
     <style>
@@ -20,10 +20,10 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 st.title("🚢 Модель прогнозирования ледовой обстановки на СМП")
-st.markdown("**Система поддержки принятия решений (СППР)**")
+st.markdown("**Система поддержки принятия решений (СППР) | Нейросетевое моделирование**")
 st.markdown("---")
 
-# --- МОДЕЛЬ ---
+# --- ЗАГРУЗКА МОДЕЛИ ---
 @st.cache_resource
 def load_ai_model():
     if not os.path.exists('ice_model_month_v2.h5'): return None
@@ -31,12 +31,12 @@ def load_ai_model():
 
 try:
     model = load_ai_model()
-except Exception as e:
-    st.error(f"Ошибка модели: {e}")
+except:
     model = None
 
-# --- УТИЛИТЫ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 def extract_date(filename):
+    """Парсинг даты из имени файла"""
     match = re.search(r'(\d{8})', filename)
     if match:
         try:
@@ -45,25 +45,27 @@ def extract_date(filename):
             return None
     return None
 
-def clean_data_initial(d):
-    """Очистка ТОЛЬКО для первого сырого кадра"""
-    d = np.nan_to_num(d, nan=0.0)
-    d = np.where(d > 100, 0, d)
-    if np.max(d) > 1.05: d = d / 100.0 # Нормализация 0..1
+def preprocess_raw_data(data):
+    """Первичная обработка сырых данных со спутника"""
+    d = np.nan_to_num(data, nan=0.0)
+    d = np.where(d > 100, 0, d) # Маскируем сушу (если она > 100)
+    if np.max(d) > 1.05: 
+        d = d / 100.0 # Нормализация в 0..1
     return d
 
 # --- БОКОВАЯ ПАНЕЛЬ ---
 with st.sidebar:
-    st.header("🗂️ Данные")
+    st.header("🗂️ Входные данные")
     
     if model is None:
         st.error("❌ Файл модели не найден")
         st.stop()
     else:
-        st.success("✅ Система готова")
+        st.success("✅ Ядро модели активно")
 
+    # Загрузчик файлов
     uploaded_files = st.file_uploader(
-        "Загрузите файлы (Апрель)", 
+        "Загрузите массив данных (.nc)", 
         type=['nc'], 
         accept_multiple_files=True
     )
@@ -76,150 +78,139 @@ with st.sidebar:
                 file_db[dt] = f
         
         sorted_dates = sorted(file_db.keys())
-        st.info(f"Снимков: {len(file_db)}")
+        st.info(f"Индексировано снимков: {len(file_db)}")
         
         if len(file_db) > 0:
             st.markdown("---")
             start_date = st.selectbox("Дата старта", options=sorted_dates, format_func=lambda x: x.strftime("%d.%m.%Y"))
-            horizon = st.slider("Горизонт (сут.)", 1, 7, 3)
+            horizon = st.slider("Горизонт прогноза (сут.)", 1, 7, 3)
             
             target_date = start_date + timedelta(days=horizon)
             has_truth = target_date in file_db
             
-            st.write(f"Цель: **{target_date.strftime('%d.%m.%Y')}**")
+            st.write(f"Целевая дата: **{target_date.strftime('%d.%m.%Y')}**")
             
-            if not has_truth:
-                st.warning("Нет файла для проверки")
-                btn = False
-            else:
+            if has_truth:
                 btn = st.button("🚀 ВЫПОЛНИТЬ РАСЧЕТ", type="primary")
+            else:
+                st.warning("⚠️ Нет файла для верификации прогноза")
+                btn = False
 
-# --- ЛОГИКА ---
+# --- ОСНОВНАЯ ЛОГИКА ---
 if 'btn' in locals() and btn:
     try:
-        status = st.status("Диагностика и чтение данных...", expanded=True)
+        # Индикатор прогресса
+        status = st.status("Выполнение нейросетевого прогноза...", expanded=True)
         
-        # === ФУНКЦИЯ ЧТЕНИЯ С ВЫВОДОМ ОШИБОК ===
-        def safe_read_debug(file_obj, temp_name):
-            # 1. Запись
-            file_obj.seek(0)
-            with open(temp_name, "wb") as f:
-                f.write(file_obj.read())
-            
-            # 2. Проверка размера (Сразу скажет, если это LFS ссылка)
-            size = os.path.getsize(temp_name)
-            if size < 3000:
-                st.error(f"❌ КРИТИЧЕСКАЯ ОШИБКА: Файл '{file_obj.name}' весит всего {size} байт!")
-                st.warning("Это не спутниковый снимок, а текстовая ссылка GitHub LFS. Загрузите ОРИГИНАЛЬНЫЙ файл с вашего компьютера.")
-                st.stop()
-
-            # 3. Попытка открыть разными методами
-            engines = ['netcdf4', 'h5netcdf', 'scipy']
-            errors_log = []
-            
-            for eng in engines:
-                try:
-                    ds = xr.open_dataset(temp_name, engine=eng)
-                    # Если открылось - ура, возвращаем
-                    return ds
-                except Exception as e:
-                    errors_log.append(f"Движок '{eng}': {str(e)}")
-            
-            # Если дошли сюда - значит ни один не открыл
-            st.error(f"❌ Не удалось открыть файл '{file_obj.name}'. Отчет об ошибках:")
-            for err in errors_log:
-                st.code(err, language='text')
-            
-            st.info("💡 ПОДСКАЗКА: Если ошибка 'HDF error' - файл битый. Если 'libnetcdf not found' - нет packages.txt.")
-            st.stop()
-
-        # 1. ЧТЕНИЕ СТАРТА
-        ds = safe_read_debug(file_db[start_date], "temp_start.nc")
+        # 1. ЧТЕНИЕ СТАРТОВОГО КАДРА
+        f_obj = file_db[start_date]
+        f_obj.seek(0)
+        with open("temp_start.nc", "wb") as f: f.write(f_obj.read())
+        
+        # Открываем универсально (xarray сам разберется с форматом)
+        ds = xr.open_dataset("temp_start.nc")
         var_name = [v for v in ds.data_vars if 'ice' in v or 'conc' in v][0]
         data_raw = ds[var_name].isel(time=0).squeeze().values
         
-        # Маска
+        # Сохраняем маску суши для финала
         land_mask = np.isnan(data_raw) | (data_raw > 100)
         orig_shape = data_raw.shape
         
-        # Первичная очистка
-        current_img = clean_data_initial(data_raw)
+        # Препроцессинг
+        current_img = preprocess_raw_data(data_raw)
         
-        # Тензор
+        # Подготовка тензора (Input)
         input_tensor = tf.image.resize(current_img[..., np.newaxis], [256, 256])
         input_batch = np.expand_dims(input_tensor, axis=0)
         
-        # 2. ЦИКЛ ПРОГНОЗА
+        # 2. ЦИКЛ ПРОГНОЗИРОВАНИЯ (РЕКУРСИЯ)
         prog_bar = status.progress(0)
-        alpha = 0.75 
+        alpha = 0.75 # Коэффициент инерции (стабилизация картинки)
         
         for day in range(1, horizon + 1):
+            # Шаг 1: Предсказание нейросети
             pred_ai = model.predict(input_batch, verbose=0)
+            
+            # Шаг 2: Стабилизация (смешивание с предыдущим кадром)
+            # Это убирает "дребезг" и размытие
             pred_stab = (input_batch * alpha) + (pred_ai * (1 - alpha))
+            
+            # Шаг 3: Фильтрация шума
             pred_clean = tf.where(pred_stab > 0.1, pred_stab, 0.0)
+            
+            # Выход становится входом для следующего дня
             input_batch = pred_clean
             
-            status.write(f"✅ День {day}: Расчет завершен")
+            status.write(f"✅ День {day}: Расчет дрейфа завершен")
             prog_bar.progress(day / horizon)
         
-        # Результат
+        # 3. ВОССТАНОВЛЕНИЕ РЕЗУЛЬТАТА
         final_full = tf.image.resize(input_batch[0], [orig_shape[0], orig_shape[1]]).numpy().squeeze()
         final_viz = copy.deepcopy(final_full)
-        final_viz[land_mask] = np.nan
+        final_viz[land_mask] = np.nan # Возвращаем сушу
         
-        status.update(label="Готово", state="complete", expanded=False)
+        status.update(label="Моделирование завершено успешно", state="complete", expanded=False)
 
-        # 3. ФАКТ
-        ds_t = safe_read_debug(file_db[target_date], "temp_target.nc")
-        target_raw = ds_t[var_name].isel(time=0).squeeze().values
-        target_clean = clean_data_initial(target_raw)
+        # 4. ПОДГОТОВКА ЭТАЛОНА (Ground Truth)
+        t_obj = file_db[target_date]
+        t_obj.seek(0)
+        with open("temp_target.nc", "wb") as f: f.write(t_obj.read())
         
+        ds_t = xr.open_dataset("temp_target.nc")
+        target_raw = ds_t[var_name].isel(time=0).squeeze().values
+        
+        # Очищаем эталон той же функцией
+        target_clean = preprocess_raw_data(target_raw)
         target_viz = copy.deepcopy(target_clean)
         target_viz[land_mask] = np.nan
         
-        # 4. МЕТРИКИ
+        # 5. РАСЧЕТ МЕТРИК И ОШИБОК
         diff_map = np.abs(final_full - target_clean)
-        diff_map[land_mask] = np.nan
+        diff_map[land_mask] = np.nan # Не считаем ошибку на суше
         
         mae = np.nanmean(diff_map) * 100
         accuracy = 100 - mae
 
-        # 5. ВИЗУАЛИЗАЦИЯ
-        st.subheader(f"📊 Результат (Горизонт: {horizon} сут.)")
+        # 6. ВИЗУАЛИЗАЦИЯ (ТРИПТИХ)
+        st.subheader(f"📊 Результаты верификации (Горизонт: {horizon} сут.)")
         
-        c1, c2, c3 = st.columns(3)
+        col1, col2, col3 = st.columns(3)
         cmap = plt.cm.Blues_r.copy()
-        cmap.set_bad('#1E1E1E')
+        cmap.set_bad('#1E1E1E') # Цвет суши
         
-        with c1:
+        with col1:
             st.markdown("### 🧠 Прогноз ИИ")
             fig1, ax1 = plt.subplots(figsize=(6,6), facecolor='#0e1117')
             ax1.imshow(final_viz, cmap=cmap, vmin=0, vmax=1)
             ax1.axis('off')
             st.pyplot(fig1)
             
-        with c2:
-            st.markdown("### 🛰️ Факт")
+        with col2:
+            st.markdown("### 🛰️ Факт (Спутник)")
             fig2, ax2 = plt.subplots(figsize=(6,6), facecolor='#0e1117')
             ax2.imshow(target_viz, cmap=cmap, vmin=0, vmax=1)
             ax2.axis('off')
             st.pyplot(fig2)
             
-        with c3:
-            st.markdown("### 🔥 Ошибки")
+        with col3:
+            st.markdown("### 🔥 Карта ошибок")
             fig3, ax3 = plt.subplots(figsize=(6,6), facecolor='#0e1117')
+            # Тепловая карта: Черный -> Красный -> Желтый
             im = ax3.imshow(diff_map, cmap='hot', vmin=0, vmax=0.5)
+            cbar = plt.colorbar(im, ax=ax3, fraction=0.046, pad=0.04)
+            cbar.ax.tick_params(colors='white')
             ax3.axis('off')
             st.pyplot(fig3)
-            
+        
+        # ИТОГОВЫЕ МЕТРИКИ
         st.markdown("---")
         m1, m2, m3 = st.columns(3)
-        m1.metric("Точность", f"{accuracy:.2f}%")
-        m2.metric("MAE", f"{mae:.2f}%")
-        m3.metric("Статус", "✅ НОРМА" if accuracy > 80 else "⚠️")
+        m1.metric("Точность (Accuracy)", f"{accuracy:.2f}%")
+        m2.metric("Средняя ошибка (MAE)", f"{mae:.2f}%")
+        m3.metric("Вердикт", "✅ ДОСТОВЕРНО" if accuracy > 80 else "⚠️ ТРЕБУЕТ УТОЧНЕНИЯ")
 
     except Exception as e:
-        st.error(f"Системная ошибка: {e}")
+        st.error(f"Произошла ошибка при расчете: {e}")
 
 elif not uploaded_files:
-    st.info("👈 Загрузите файлы.")
+    st.info("👈 Пожалуйста, загрузите файлы данных (.nc) через меню слева.")
