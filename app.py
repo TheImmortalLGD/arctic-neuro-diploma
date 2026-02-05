@@ -68,7 +68,7 @@ if uploaded_file is not None:
         with open("temp_input.nc", "wb") as f:
             f.write(uploaded_file.getbuffer())
         
-        ds = xr.open_dataset("temp_input.nc")
+        ds = xr.open_dataset("temp_input.nc", engine='h5netcdf')
         var_name = [v for v in ds.data_vars if 'ice' in v or 'conc' in v][0]
         data_raw = ds[var_name].isel(time=0).squeeze().values
         
@@ -167,3 +167,4 @@ if uploaded_file is not None:
 
     except Exception as e:
         st.error(f"Ошибка: {e}")
+
