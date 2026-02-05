@@ -8,156 +8,232 @@ import copy
 import h5netcdf
 import os
 import time
+import re
+from datetime import datetime, timedelta
 
-# --- НАСТРОЙКИ СТРАНИЦЫ ---
-st.set_page_config(page_title="Ice Forecast Production", layout="wide", page_icon="🧊")
-
-# CSS для профессионального темного интерфейса
+# --- НАСТРОЙКИ ИНТЕРФЕЙСА ---
+st.set_page_config(page_title="Arctic-PRO: Validation Suite", layout="wide", page_icon="🧊")
 st.markdown("""
     <style>
-    .stApp {
-        background-color: #0e1117;
-        color: white;
-    }
-    .stMetric {
-        background-color: #1e212b;
-        padding: 15px;
-        border-radius: 10px;
-    }
+    .stApp {background-color: #0e1117; color: white;}
+    .stMetric {background-color: #1e212b; padding: 10px; border-radius: 5px; border: 1px solid #333;}
     </style>
     """, unsafe_allow_html=True)
 
-# --- ЗАГОЛОВОК ---
-st.title("🧊 АИС «Арктика-PRO»")
-st.markdown("**Интеллектуальная система прогнозирования ледовой обстановки (Neural Network Inference)**")
+st.title("🧊 АИС «Арктика-PRO»: Валидация на временных рядах")
+st.markdown("**Эксперимент: Проверка точности модели на данных АПРЕЛЯ (Unseen Data)**")
+st.info("ℹ️ Режим работы: Модель обучена на МАРТЕ. Тестирование проводится на АПРЕЛЕ.")
 st.markdown("---")
 
-# --- ЗАГРУЗКА МОДЕЛИ (КЭШИРОВАНИЕ) ---
+# --- ЗАГРУЗКА МОДЕЛИ ---
 @st.cache_resource
 def load_ai_model():
-    model_path = 'ice_model_month_v2.h5'
-    
-    if not os.path.exists(model_path):
-        return None
-    
-    # Загружаем обученную модель
-    model = load_model(model_path)
-    return model
+    # Ищем файл модели
+    if not os.path.exists('ice_model_month_v2.h5'): return None
+    return load_model('ice_model_month_v2.h5')
 
-# Пытаемся загрузить модель при старте
 try:
     model = load_ai_model()
 except Exception as e:
-    st.error(f"Ошибка загрузки модели: {e}")
+    st.error(f"Ошибка модели: {e}")
     model = None
+
+# --- ФУНКЦИЯ ПОИСКА ДАТЫ В ИМЕНИ ФАЙЛА ---
+def extract_date(filename):
+    # Ищет паттерн YYYYMMDD (например, 20200401)
+    match = re.search(r'(\d{8})', filename)
+    if match:
+        try:
+            return datetime.strptime(match.group(1), "%Y%m%d")
+        except:
+            return None
+    return None
 
 # --- БОКОВАЯ ПАНЕЛЬ ---
 with st.sidebar:
-    st.header("⚙️ Терминал управления")
+    st.header("🗂️ Загрузка архива")
     
-    # Индикатор статуса модели
-    if model is not None:
-        st.success("✅ SYSTEM READY\nModel: CNN U-Net v2\nWeights: Loaded")
+    if model is None:
+        st.error("❌ Файл ice_model_month_v2.h5 не найден!")
+        st.stop()
     else:
-        st.error("❌ MODEL NOT FOUND")
-        st.warning("Пожалуйста, загрузите файл 'ice_model_month_v2.h5' в репозиторий GitHub.")
+        st.success("✅ Нейросеть (Март) активна")
     
-    st.markdown("---")
-    uploaded_file = st.file_uploader("Входной поток данных (.nc)", type=['nc'])
+    # МУЛЬТИ-ЗАГРУЗКА
+    uploaded_files = st.file_uploader(
+        "Шаг 1. Загрузите файлы (31 марта + Апрель)", 
+        type=['nc'], 
+        accept_multiple_files=True
+    )
     
-    # Кнопка активна только если есть модель и файл
-    predict_btn = st.button("⚡ ВЫПОЛНИТЬ ПРОГНОЗ", type="primary", disabled=(uploaded_file is None or model is None))
-    
-    st.info("Режим: Production Inference (без дообучения)")
+    # Индексация файлов
+    file_db = {} # Словарь: {Дата : Файл}
+    if uploaded_files:
+        for f in uploaded_files:
+            dt = extract_date(f.name)
+            if dt:
+                file_db[dt] = f
+        
+        # Сортируем даты
+        sorted_dates = sorted(file_db.keys())
+        st.success(f"Распознано снимков: {len(file_db)}")
+        
+        if len(file_db) > 0:
+            st.markdown("---")
+            st.header("⚙️ Параметры эксперимента")
+            
+            # ВЫБОР ДАТЫ СТАРТА
+            start_date = st.selectbox(
+                "Шаг 2. Дата старта (Начальные условия)", 
+                options=sorted_dates,
+                format_func=lambda x: x.strftime("%d.%m.%Y")
+            )
+            
+            # ВЫБОР ГОРИЗОНТА
+            # Ограничиваем горизонт, чтобы не выйти за пределы загруженных файлов
+            max_horizon = 14
+            horizon = st.slider("Шаг 3. Горизонт прогноза (суток)", 1, max_horizon, 3)
+            
+            # ВЫЧИСЛЕНИЕ ЦЕЛЕВОЙ ДАТЫ
+            target_date = start_date + timedelta(days=horizon)
+            has_truth = target_date in file_db
+            
+            st.markdown(f"**Целевая дата:** `{target_date.strftime('%d.%m.%Y')}`")
+            
+            if has_truth:
+                st.info("✅ Файл для проверки найден в загрузках")
+                btn_disabled = False
+            else:
+                st.warning("⚠️ Файла за эту дату нет. Сравнение невозможно.")
+                btn_disabled = True
+            
+            predict_btn = st.button("🚀 ЗАПУСТИТЬ МОДЕЛИРОВАНИЕ", type="primary", disabled=btn_disabled)
 
 # --- ОСНОВНАЯ ЛОГИКА ---
-if uploaded_file is not None and model is not None:
+if 'predict_btn' in locals() and predict_btn:
     try:
-        # Сохраняем временный файл
-        with open("temp_input.nc", "wb") as f:
-            f.write(uploaded_file.getbuffer())
-            
-        # Чтение файла (используем безопасный движок h5netcdf)
-        ds = xr.open_dataset("temp_input.nc", engine='h5netcdf')
+        # Контейнер для статуса
+        status_container = st.status("Инициализация вычислительного ядра...", expanded=True)
         
-        # Автоматический поиск переменной льда
+        # 1. ЧТЕНИЕ СТАРТОВОГО ФАЙЛА
+        start_file_obj = file_db[start_date]
+        start_file_obj.seek(0) # Сброс курсора
+        
+        with open("start_temp.nc", "wb") as f: f.write(start_file_obj.read())
+        
+        ds = xr.open_dataset("start_temp.nc", engine='h5netcdf')
         var_name = [v for v in ds.data_vars if 'ice' in v or 'conc' in v][0]
         data_raw = ds[var_name].isel(time=0).squeeze().values
         
-        # === 1. ПРЕПРОЦЕССИНГ ===
-        # Сохраняем маску суши (где NaN или >100)
+        # Подготовка данных
         land_mask = np.isnan(data_raw) | (data_raw > 100)
+        orig_shape = data_raw.shape
         
-        # Очищаем данные для подачи в нейросеть
-        data_clean = np.nan_to_num(data_raw, nan=0.0)
-        data_clean = np.where(data_clean > 100, 0, data_clean)
+        def clean(d):
+            d = np.nan_to_num(d, nan=0.0)
+            d = np.where(d > 100, 0, d)
+            if np.max(d) > 1.05: d = d / 100.0
+            return d
+
+        current_img = clean(data_raw)
         
-        # Нормализация (если данные 0-100, делаем 0-1)
-        if np.max(data_clean) > 1.05: 
-            data_clean = data_clean / 100.0
+        # Тензор для входа
+        input_tensor = tf.image.resize(current_img[..., np.newaxis], [256, 256])
+        input_batch = np.expand_dims(input_tensor, axis=0)
+        
+        # 2. ЦИКЛ ПРОГНОЗИРОВАНИЯ (РЕКУРСИЯ)
+        progress_bar = status_container.progress(0)
+        
+        for day in range(1, horizon + 1):
+            # Инференс
+            pred = model.predict(input_batch, verbose=0)
             
-        # Ресайз до 256x256 (вход нейросети)
-        img_tensor = tf.image.resize(data_clean[..., np.newaxis], [256, 256])
-        img_input = np.expand_dims(img_tensor, axis=0)
+            # Выход становится входом для следующего дня
+            input_batch = pred 
+            
+            # Обновление статуса
+            sim_date = start_date + timedelta(days=day)
+            status_container.write(f"✅ День {day} ({sim_date.strftime('%d.%m')}): Расчет дрейфа завершен")
+            progress_bar.progress(day / horizon)
+            time.sleep(0.2) # Имитация нагрузки для наглядности
+            
+        # 3. ПОСТ-ОБРАБОТКА РЕЗУЛЬТАТА
+        final_small = input_batch[0]
+        final_full = tf.image.resize(final_small, [orig_shape[0], orig_shape[1]]).numpy().squeeze()
+        
+        # Восстанавливаем маску суши
+        final_viz = copy.deepcopy(final_full)
+        final_viz[land_mask] = np.nan
+        
+        status_container.update(label="Расчет завершен успешно!", state="complete", expanded=False)
 
-        st.toast("Данные валидированы. Готовность к расчету.", icon="📡")
-
-        if predict_btn:
-            with st.spinner('Выполняется нейросетевой расчет (Inference)...'):
-                start_time = time.time()
-                
-                # === 2. ИНФЕРЕНС (ПРОГНОЗ) ===
-                prediction = model.predict(img_input)
-                
-                elapsed = time.time() - start_time
-                
-                # === 3. ПОСТ-ПРОЦЕССИНГ ===
-                # Восстанавливаем оригинальный размер
-                pred_resized = tf.image.resize(prediction[0], [data_raw.shape[0], data_raw.shape[1]]).numpy().squeeze()
-                
-                # Накладываем маску суши обратно (чтобы были берега)
-                pred_final = copy.deepcopy(pred_resized)
-                pred_final[land_mask] = np.nan
-                
-                # Накладываем маску суши на входные данные для красоты
-                input_viz = copy.deepcopy(data_clean)
-                input_viz[land_mask] = np.nan
-
-            # === 4. ВИЗУАЛИЗАЦИЯ ===
-            st.success(f"Прогноз успешно построен за {elapsed:.4f} сек.")
+        # 4. СРАВНЕНИЕ С ФАКТОМ
+        target_file_obj = file_db[target_date]
+        target_file_obj.seek(0)
+        with open("target_temp.nc", "wb") as f: f.write(target_file_obj.read())
+        
+        ds_target = xr.open_dataset("target_temp.nc", engine='h5netcdf')
+        target_raw = ds_target[var_name].isel(time=0).squeeze().values
+        target_clean = clean(target_raw)
+        
+        # Расчет ошибки (MAE)
+        diff = np.abs(final_full - target_clean)
+        diff[land_mask] = np.nan # Игнорируем сушу
+        mae = np.nanmean(diff) * 100 # В процентах
+        accuracy = 100 - mae
+        
+        # 5. ВИЗУАЛИЗАЦИЯ
+        st.subheader(f"📊 Отчет о валидации ({start_date.strftime('%d.%m')} ➝ {target_date.strftime('%d.%m')})")
+        
+        col1, col2, col3 = st.columns(3)
+        cmap = plt.cm.Blues_r.copy()
+        cmap.set_bad('#1E1E1E') # Цвет суши
+        
+        with col1:
+            st.caption("1. СТАРТ (Исходные данные)")
+            fig1, ax1 = plt.subplots(facecolor='#0e1117')
+            start_viz = copy.deepcopy(current_img)
+            start_viz[land_mask] = np.nan
+            ax1.imshow(start_viz, cmap=cmap, vmin=0, vmax=1)
+            ax1.axis('off')
+            st.pyplot(fig1)
             
-            c1, c2 = st.columns(2)
+        with col2:
+            st.caption(f"2. ПРОГНОЗ НЕЙРОСЕТИ (+{horizon} сут.)")
+            fig2, ax2 = plt.subplots(facecolor='#0e1117')
+            ax2.imshow(final_viz, cmap=cmap, vmin=0, vmax=1)
+            ax2.axis('off')
+            st.pyplot(fig2)
             
-            # Настройка палитры (Вода=Синяя, Суша=Темно-серая)
-            cmap = plt.cm.Blues_r.copy()
-            cmap.set_bad('#262626') 
-            
-            with c1:
-                st.subheader("📡 Фактическая обстановка (T)")
-                fig1, ax1 = plt.subplots(figsize=(6, 6), facecolor='#0e1117')
-                ax1.imshow(input_viz, cmap=cmap, vmin=0, vmax=1)
-                ax1.axis('off')
-                st.pyplot(fig1)
-                
-            with c2:
-                st.subheader("🧠 Прогноз ИИ (T+24ч)")
-                fig2, ax2 = plt.subplots(figsize=(6, 6), facecolor='#0e1117')
-                ax2.imshow(pred_final, cmap=cmap, vmin=0, vmax=1)
-                ax2.axis('off')
-                st.pyplot(fig2)
-            
-            # Метрики системы
-            st.markdown("### Аналитика")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Время отклика", f"{elapsed:.3f} s")
-            m2.metric("Уверенность модели", "98.4%")
-            m3.metric("Используемая память", "145 MB")
-            m4.metric("Статус навигации", "Штатный", delta="OK")
+        with col3:
+            st.caption("3. ФАКТ (Спутниковый контроль)")
+            fig3, ax3 = plt.subplots(facecolor='#0e1117')
+            target_viz = copy.deepcopy(target_clean)
+            target_viz[land_mask] = np.nan
+            ax3.imshow(target_viz, cmap=cmap, vmin=0, vmax=1)
+            ax3.axis('off')
+            st.pyplot(fig3)
+        
+        # МЕТРИКИ
+        st.markdown("---")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Точность прогноза", f"{accuracy:.2f}%", help="100% - средняя ошибка")
+        m2.metric("Горизонт планирования", f"{horizon} суток")
+        m3.metric("Статус теста", "УСПЕХ" if accuracy > 80 else "ТРЕБУЕТ КАЛИБРОВКИ", 
+                 delta="Pass" if accuracy > 80 else "-Fail")
+        
+        # КАРТА ОШИБОК
+        with st.expander("🔎 Детальный анализ ошибок (Тепловая карта)"):
+            fig_err, ax_err = plt.subplots(figsize=(10, 3), facecolor='#0e1117')
+            diff_viz = copy.deepcopy(diff)
+            im = ax_err.imshow(diff_viz, cmap='hot', vmin=0, vmax=0.4) # Ошибки > 40% ярко-белые
+            plt.colorbar(im, ax=ax_err, label="Величина отклонения")
+            ax_err.set_title("Зоны расхождения прогноза с фактом", color='white')
+            ax_err.axis('off')
+            st.pyplot(fig_err)
 
     except Exception as e:
-        st.error(f"Системная ошибка: {e}")
-        st.caption("Попробуйте перезагрузить страницу или проверить формат файла.")
+        st.error(f"Критическая ошибка: {e}")
 
-elif uploaded_file is None:
-    # Красивая заглушка, пока нет файла
-    st.info("👈 Загрузите спутниковый снимок (.nc) в меню слева для начала работы.")
+elif not uploaded_files:
+    st.info("👋 Привет! Чтобы начать, выделите все файлы .nc за апрель и перетащите их в панель слева.")
