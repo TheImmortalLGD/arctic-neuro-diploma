@@ -141,7 +141,14 @@ if 'predict_btn' in locals() and predict_btn:
         
         for day in range(1, horizon + 1):
             pred = model.predict(input_batch, verbose=0)
-            input_batch = pred 
+            
+            # === ХИТРОСТЬ: ПОВЫШЕНИЕ КОНТРАСТА ===
+            # Мы говорим: всё, что слабее 0.4 - это вода (0).
+            # Всё, что сильнее - усиливаем. Это уберет "размытое пятно".
+            pred_sharpened = tf.where(pred > 0.3, pred, 0.0) 
+            
+            # Подаем на следующий шаг уже "чистую" картинку
+            input_batch = pred_sharpened 
             
             sim_date = start_date + timedelta(days=day)
             status_container.write(f"✅ Расчет на {sim_date.strftime('%d.%m.%Y')} завершен")
@@ -223,3 +230,4 @@ if 'predict_btn' in locals() and predict_btn:
 
 elif not uploaded_files:
     st.info("👈 Загрузите архив данных (.nc) в меню слева для начала работы.")
+
