@@ -17,7 +17,6 @@ st.markdown("""
     <style>
     .stApp {background-color: #0e1117; color: white;}
     .stMetric {background-color: #1e212b; padding: 10px; border-radius: 5px; border: 1px solid #333;}
-    /* Увеличиваем заголовки графиков */
     .css-10trblm {font-size: 1.2rem; font-weight: bold;}
     </style>
     """, unsafe_allow_html=True)
@@ -139,7 +138,6 @@ if 'predict_btn' in locals() and predict_btn:
             pred_ai = model.predict(input_batch, verbose=0)
             
             # Стабилизация (смешиваем с предыдущим шагом)
-            # Это убирает эффект "размытого пятна"
             pred_stabilized = (input_batch * alpha) + (pred_ai * (1 - alpha))
             
             # Фильтрация шума
@@ -157,4 +155,73 @@ if 'predict_btn' in locals() and predict_btn:
         final_full = tf.image.resize(final_small, [orig_shape[0], orig_shape[1]]).numpy().squeeze()
         
         final_viz = copy.deepcopy(final_full)
-        final_viz[land
+        # Вот здесь была ошибка, теперь скобка закрыта корректно:
+        final_viz[land_mask] = np.nan
+        
+        status_container.update(label="Моделирование завершено", state="complete", expanded=False)
+
+        # 4. ПОДГОТОВКА ФАКТА (TARGET)
+        target_file_obj = file_db[target_date]
+        target_file_obj.seek(0)
+        with open("target_temp.nc", "wb") as f: f.write(target_file_obj.read())
+        ds_target = xr.open_dataset("target_temp.nc", engine='h5netcdf')
+        target_raw = ds_target[var_name].isel(time=0).squeeze().values
+        target_clean = clean(target_raw)
+        
+        target_viz = copy.deepcopy(target_clean)
+        target_viz[land_mask] = np.nan
+        
+        # Расчет метрик
+        diff = np.abs(final_full - target_clean)
+        diff[land_mask] = np.nan
+        mae = np.nanmean(diff) * 100
+        accuracy = 100 - mae
+
+        # ==========================================
+        # 5. ВИЗУАЛИЗАЦИЯ (2 КОЛОНКИ)
+        # ==========================================
+        st.subheader(f"📊 Результаты валидации: Прогноз на {horizon} сут.")
+        
+        col1, col2 = st.columns(2)
+        cmap = plt.cm.Blues_r.copy()
+        cmap.set_bad('#1E1E1E') # Цвет суши
+        
+        with col1:
+            st.markdown(f"### 🧠 Прогноз ИИ")
+            st.caption(f"Расчетная дата: {target_date.strftime('%d.%m.%Y')}")
+            fig1, ax1 = plt.subplots(figsize=(8, 8), facecolor='#0e1117')
+            ax1.imshow(final_viz, cmap=cmap, vmin=0, vmax=1)
+            ax1.axis('off')
+            st.pyplot(fig1)
+            
+        with col2:
+            st.markdown(f"### 🛰️ Факт (Спутник)")
+            st.caption(f"Фактическая дата: {target_date.strftime('%d.%m.%Y')}")
+            fig2, ax2 = plt.subplots(figsize=(8, 8), facecolor='#0e1117')
+            ax2.imshow(target_viz, cmap=cmap, vmin=0, vmax=1)
+            ax2.axis('off')
+            st.pyplot(fig2)
+        
+        # МЕТРИКИ ПОД ГРАФИКАМИ
+        st.markdown("---")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Точность (Accuracy)", f"{accuracy:.2f}%", help="Совпадение площади покрытия")
+        m2.metric("Средняя ошибка (MAE)", f"{mae:.2f}%")
+        m3.metric("Результат теста", "УСПЕХ" if accuracy > 75 else "НИЖЕ НОРМЫ", 
+                 delta="Valid" if accuracy > 75 else "Invalid")
+        
+        # КАРТА ОШИБОК (Свернута)
+        with st.expander("🔎 Показать зону расхождений"):
+            fig_err, ax_err = plt.subplots(figsize=(10, 4), facecolor='#0e1117')
+            diff_viz = copy.deepcopy(diff)
+            im = ax_err.imshow(diff_viz, cmap='hot', vmin=0, vmax=0.5)
+            plt.colorbar(im, ax=ax_err, label="Ошибка концентрации")
+            ax_err.set_title("Красные зоны = Ошибка прогноза", color='white')
+            ax_err.axis('off')
+            st.pyplot(fig_err)
+
+    except Exception as e:
+        st.error(f"Ошибка выполнения: {e}")
+
+elif not uploaded_files:
+    st.info("👈 Загрузите архив .nc файлов для запуска системы.")
